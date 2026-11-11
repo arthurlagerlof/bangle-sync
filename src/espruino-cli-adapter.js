@@ -3,70 +3,126 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { safeName, classifyDeviceFile } from './core.js';
 
 const exec = promisify(execFile);
+const localRequire = createRequire(import.meta.url);
 const MARKER = '__BANGLESYNC_RESULT_';
 const safeError = text => String(text).replace(/\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b/gi, '[Bluetooth address redacted]').replace(/\b(?:[0-9A-F]{2}-){5}[0-9A-F]{2}\b/gi, '[Bluetooth address redacted]').replace(/\b(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{8,}\b/g, '[identifier redacted]').slice(0, 1000);
 const b64 = data => Buffer.from(data).toString('base64');
 const sha256 = data => createHash('sha256').update(data).digest('hex');
+const resolveEspruinoCli = () => {
+  try { return localRequire.resolve('espruino/bin/espruino-cli.js'); } catch {}
+  const localCli = fileURLToPath(new URL('../node_modules/espruino/bin/espruino-cli.js', import.meta.url));
+  return existsSync(localCli) ? localCli : null;
+};
 
 export class EspruinoCliAdapter {
-  constructor({ executable = null, timeoutMs = 15000, maxBufferBytes = 65536, spawnProcess = spawn, ownership = {}, applications = {}, baselinePaths = {}, knownFiles = [], inlineFiles = [] } = {}) {
-    const bundledCli = fileURLToPath(new URL('../node_modules/espruino/bin/espruino-cli.js', import.meta.url));
-    this.executable = executable && executable.toLowerCase().endsWith('.js') ? process.execPath : (executable || process.execPath);
-    this.cliArguments = executable ? (executable.toLowerCase().endsWith('.js') ? [executable] : []) : [bundledCli];
-    if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(this.executable)) throw new Error('On Windows, configure the EspruinoTools JavaScript CLI file rather than a .cmd/.bat shim.');
+  constructor({ executable = null, resolveCli = resolveEspruinoCli, timeoutMs = 15000, maxBufferBytes = 65536, spawnProcess = spawn, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), ownership = {}, applications = {}, baselinePaths = {}, knownFiles = [], inlineFiles = [] } = {}) {
+    const cliPath = executable || resolveCli();
+    this.executable = cliPath ? (cliPath.toLowerCase().endsWith('.js') ? process.execPath : cliPath) : null;
+    this.cliArguments = cliPath ? (cliPath.toLowerCase().endsWith('.js') ? [cliPath] : []) : [];
+    this.cliAvailable = Boolean(cliPath);
+    if (process.platform === 'win32' && cliPath && /\.(?:cmd|bat)$/i.test(cliPath)) throw new Error('On Windows, configure the EspruinoTools JavaScript CLI file rather than a .cmd/.bat shim.');
     if (!Number.isSafeInteger(maxBufferBytes) || maxBufferBytes < 1024 || maxBufferBytes > 4 * 1024 * 1024) throw new Error('REPL buffer limit must be between 1 KiB and 4 MiB.');
     if (!Array.isArray(knownFiles) || knownFiles.length > 10000) throw new Error('Known user-file catalog is invalid or exceeds the inventory limit.');
-    this.timeoutMs = timeoutMs; this.maxBufferBytes = maxBufferBytes; this.spawnProcess = spawnProcess; this.ownership = ownership; this.applications = applications; this.baselinePaths = baselinePaths;
+    this.timeoutMs = timeoutMs; this.maxBufferBytes = maxBufferBytes; this.spawnProcess = spawnProcess; this.sleep = sleep; this.ownership = ownership; this.applications = applications; this.baselinePaths = baselinePaths;
     const candidates = new Set([...knownFiles, ...Object.keys(ownership)]);
     this.knownFiles = [...candidates].filter(name => safeName(name) && classifyDeviceFile(name).classification !== 'protected-system').sort();
     this.inlineFiles = new Set(inlineFiles.filter(name => this.knownFiles.includes(name)));
     this.child = null; this.buffer = ''; this.waiters = []; this.closed = false; this.deviceId = null;
+    this.discoveryPromise = null; this.connectionPromise = null; this.connectionDeviceId = null; this.reconnectPromise = null; this.disconnectPromise = null;
   }
-  async discover() {
-    try {
-      const { stdout } = await exec(this.executable, [...this.cliArguments, '--list', '--scan-timeout', '10'], { timeout: this.timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 });
-      return stdout.split(/\r?\n/).filter(line => /bangle/i.test(line)).map(line => {
-        const mac = line.match(/\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b/i)?.[0];
-        const name = line.replace(/\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b/ig, '').replace(/\s+/g, ' ').trim();
-        return { id: mac ?? null, name: name || 'Bangle.js device', transport: 'EspruinoTools subprocess' };
-      });
-    } catch (error) {
-      const diagnostic = `${error.stdout ?? ''}\n${error.stderr ?? ''}`;
-      if (/No Ports Found/i.test(diagnostic)) throw new Error('EspruinoTools reported no selectable Bangle.js device. Make the watch discoverable, ensure Bluetooth is enabled, and disconnect it from other hosts before retrying. Device identifiers were not logged.');
-      throw new Error(`EspruinoTools discovery failed (${safeError(error.code ?? error.message)}). Check the EspruinoTools CLI and Windows BLE permissions.`);
-    }
+  _assertCliAvailable() {
+    if (!this.cliAvailable) throw new Error('EspruinoTools is optional and is not installed. Install it separately and set transport.espruinoPath to its JavaScript CLI to enable physical-device commands. Simulated and workspace commands do not require EspruinoTools.');
+  }
+  async _discoverOnce() {
+    this._assertCliAvailable();
+    const { stdout } = await exec(this.executable, [...this.cliArguments, '--list', '--scan-timeout', '10'], { timeout: this.timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 });
+    return stdout.split(/\r?\n/).filter(line => /bangle/i.test(line)).map(line => {
+      const mac = line.match(/\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b/i)?.[0];
+      const name = line.replace(/\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b/ig, '').replace(/\s+/g, ' ').trim();
+      return { id: mac ?? null, name: name || 'Bangle.js device', transport: 'EspruinoTools subprocess' };
+    });
+  }
+  async discover({ retries = 3 } = {}) {
+    if (this.discoveryPromise) return this.discoveryPromise;
+    const maxAttempts = Number.isSafeInteger(retries) ? Math.max(1, Math.min(retries, 3)) : 3;
+    const pending = (async () => {
+      let lastError;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try { return await this._discoverOnce(); }
+        catch (error) {
+          lastError = error;
+          const diagnostic = `${error.stdout ?? ''}\n${error.stderr ?? ''}`;
+          if (/No Ports Found/i.test(diagnostic) && attempt < maxAttempts) { await this.sleep(250 * attempt); continue; }
+          if (/No Ports Found/i.test(diagnostic)) throw new Error(`EspruinoTools found no selectable Bangle.js device after ${attempt} scan attempt${attempt === 1 ? '' : 's'}. Make the watch discoverable, ensure Bluetooth is enabled, and disconnect it from other hosts before retrying. Device identifiers were not logged.`);
+          throw new Error(`EspruinoTools discovery failed (${safeError(error.code ?? error.message)}). Check the EspruinoTools CLI and Windows BLE permissions.`);
+        }
+      }
+      throw new Error(`EspruinoTools discovery failed (${safeError(lastError?.message ?? 'transport unavailable')}).`);
+    })();
+    this.discoveryPromise = pending;
+    try { return await pending; }
+    finally { if (this.discoveryPromise === pending) this.discoveryPromise = null; }
   }
   async connect(deviceId) {
     if (typeof deviceId !== 'string' || !deviceId.trim() || !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(deviceId)) throw new Error('Select a valid discovered device before connecting.');
-    let lastError;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try { return await this._connectOnce(deviceId); }
-      catch (error) {
-        lastError = error;
-        if (!this._isTransportFailure(error) || attempt === 3) throw error;
-        await this.disconnect(); this.deviceId = deviceId;
-        await new Promise(resolve => setTimeout(resolve, 250 * attempt));
-      }
+    if (this.child && !this.closed) throw new Error('A device session is already active.');
+    if (this.connectionPromise) {
+      if (this.connectionDeviceId === deviceId) return this.connectionPromise;
+      throw new Error('A connection attempt for another device is already active.');
     }
-    throw new Error(`Connection failed after 3 attempts: ${safeError(lastError?.message ?? 'transport unavailable')}`);
+    const pending = (async () => {
+      let lastError;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) {
+          await this.sleep(500 * (attempt - 1));
+          let devices;
+          try { devices = await this.discover({ retries: 1 }); }
+          catch (error) { lastError = error; continue; }
+          if (!devices.some(device => device.id === deviceId)) {
+            lastError = new Error('The selected Bangle.js device was not rediscovered.');
+            continue;
+          }
+        }
+        try { return await this._connectOnce(deviceId); }
+        catch (error) {
+          lastError = error;
+          if (!this._isTransportFailure(error) || attempt === 3) throw error;
+          await this.disconnect(); this.deviceId = deviceId;
+        }
+      }
+      throw new Error(`Connection failed after 3 attempts: ${safeError(lastError?.message ?? 'transport unavailable')}`);
+    })();
+    this.connectionPromise = pending; this.connectionDeviceId = deviceId;
+    try { return await pending; }
+    finally { if (this.connectionPromise === pending) { this.connectionPromise = null; this.connectionDeviceId = null; } }
   }
   async _connectOnce(deviceId) {
+    this._assertCliAvailable();
     if (typeof deviceId !== 'string' || !deviceId.trim()) throw new Error('Select a discovered device before connecting.');
     if (this.child) throw new Error('A device session is already active.');
-    this.closed = false; this.deviceId = deviceId; this.lastDiagnostic = null; this.requestCount = 0; this.currentOperation = 'user API handshake';
+    this.closed = false; this.buffer = ''; this.deviceId = deviceId; this.lastDiagnostic = null; this.requestCount = 0; this.currentOperation = 'user API handshake';
     if (!/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(deviceId)) throw new Error('Discovered device selector is invalid.');
     const child = this.spawnProcess(this.executable, [...this.cliArguments, '--quiet', '--port', deviceId], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     this.child = child;
     child.stdout.setEncoding('utf8'); child.stdout.on('data', text => { this.buffer += text; if (Buffer.byteLength(this.buffer, 'utf8') > this.maxBufferBytes) { this._rejectAll(new Error('REPL output exceeded the configured buffer limit.')); child.kill(); return; } this._flush(); });
     child.stderr.setEncoding('utf8'); child.stderr.on('data', () => { this.lastDiagnostic = 'additional transport diagnostics were suppressed for privacy'; });
-    child.on('error', error => { this.closed = true; this._rejectAll(new Error(`EspruinoTools subprocess failed: ${safeError(error.message)}`)); });
-    child.on('close', code => { this.closed = true; this.child = null; this._rejectAll(new Error(`EspruinoTools subprocess disconnected during ${this.currentOperation} after ${this.requestCount} REPL requests (exit ${code ?? 'unknown'}). ${this.lastDiagnostic ?? ''}`)); });
+    child.on('error', error => {
+      if (this.child !== child) return;
+      this.closed = true; this._rejectAll(new Error(`EspruinoTools subprocess failed: ${safeError(error.message)}`));
+    });
+    child.on('close', code => {
+      if (this.child !== child) return;
+      this.closed = true; this.child = null;
+      this._rejectAll(new Error(`EspruinoTools subprocess disconnected during ${this.currentOperation} after ${this.requestCount} REPL requests (exit ${code ?? 'unknown'}). ${this.lastDiagnostic ?? ''}`));
+    });
     try {
       const userApi = await this._request('({bangle:typeof Bangle})');
       if (!userApi || userApi.bangle === 'undefined') throw new Error('Selected device REPL did not expose the Bangle.js user API.');
@@ -147,16 +203,40 @@ export class EspruinoCliAdapter {
   }
   _isTransportFailure(error) { return /disconnected|timed out|No active EspruinoTools|subprocess failed|broken pipe|download failed|could not reconnect|ENOENT/i.test(error?.message ?? ''); }
   async _reconnect() {
+    if (this.reconnectPromise) return this.reconnectPromise;
     const id = this.deviceId;
     if (!id) throw new Error('No previous device selection is available for reconnection.');
-    let lastError;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      await this.disconnect(); this.deviceId = id;
-      await new Promise(resolve => setTimeout(resolve, 250 * attempt));
-      try { return await this._connectOnce(id); } catch (error) { lastError = error; this.deviceId = id; }
-    }
-    this.deviceId = null;
-    throw new Error(`Automatic reconnect failed after 2 attempts: ${safeError(lastError?.message ?? 'transport unavailable')}`);
+    const pending = (async () => {
+      let lastError;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try { await this.disconnect(); }
+        catch (error) {
+          this.deviceId = null;
+          throw new Error(`Cannot reconnect because the previous EspruinoTools process did not close cleanly: ${safeError(error.message)}`);
+        }
+        this.deviceId = id;
+        await this.sleep(250 * (2 ** (attempt - 1)));
+        let devices;
+        try { devices = await this.discover({ retries: 1 }); }
+        catch (error) { lastError = error; this.deviceId = id; continue; }
+        if (!devices.some(device => device.id === id)) {
+          lastError = new Error('The previously selected Bangle.js device was not rediscovered.');
+          this.deviceId = id;
+          continue;
+        }
+        try { return await this._connectOnce(id); }
+        catch (error) {
+          lastError = error;
+          this.deviceId = id;
+          if (!this._isTransportFailure(error)) throw error;
+        }
+      }
+      this.deviceId = null;
+      throw new Error(`Automatic reconnect failed after 3 attempts: ${safeError(lastError?.message ?? 'transport unavailable')}`);
+    })();
+    this.reconnectPromise = pending;
+    try { return await pending; }
+    finally { if (this.reconnectPromise === pending) this.reconnectPromise = null; }
   }
   async _readViaRepl(name) {
     await this._ensureConnected();
@@ -179,6 +259,7 @@ export class EspruinoCliAdapter {
     return Buffer.concat(chunks);
   }
   async _readOnce(name) {
+    this._assertCliAvailable();
     const deviceId = this.deviceId;
     if (!deviceId) throw new Error('No selected device is available for the file download.');
     const hadSession = Boolean(this.child);
@@ -353,16 +434,44 @@ export class EspruinoCliAdapter {
     }
   }
   async disconnect() {
-    const child = this.child; this.child = null; this.closed = true; this._rejectAll(new Error('Device session closed.'));
-    if (child) {
-      await new Promise(resolve => {
-        let settled = false;
-        const finish = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
-        const timer = setTimeout(() => { if (!child.killed) child.kill(); setTimeout(finish, 500); }, 1000);
-        child.once('close', finish);
-        try { child.stdin.end(); } catch { finish(); }
-      });
-    }
-    this.deviceId = null;
+    if (this.disconnectPromise) return this.disconnectPromise;
+    const child = this.child;
+    this.child = null; this.closed = true; this._rejectAll(new Error('Device session closed.'));
+    const pending = (async () => {
+      try {
+        if (child && child.exitCode === null && child.signalCode === null) {
+          await new Promise((resolve, reject) => {
+            let settled = false, killTimer, forceTimer;
+            const finish = () => {
+              if (settled) return;
+              settled = true; clearTimeout(closeTimer); clearTimeout(killTimer); clearTimeout(forceTimer);
+              for (const stream of [child.stdin, child.stdout, child.stderr]) if (stream && !stream.destroyed && typeof stream.destroy === 'function') stream.destroy();
+              resolve();
+            };
+            const closeTimer = setTimeout(() => {
+              if (child.exitCode !== null || child.signalCode !== null) { finish(); return; }
+              try { child.kill('SIGTERM'); } catch {}
+              killTimer = setTimeout(() => {
+                if (child.exitCode !== null || child.signalCode !== null) { finish(); return; }
+                try { child.kill('SIGKILL'); } catch {}
+                forceTimer = setTimeout(() => {
+                  if (child.exitCode !== null || child.signalCode !== null) finish();
+                  else {
+                    settled = true;
+                    child.removeListener('close', finish); child.removeListener('exit', finish);
+                    reject(new Error('EspruinoTools subprocess did not exit after the disconnect timeout.'));
+                  }
+                }, 1000);
+              }, 1000);
+            }, 1000);
+            child.once('close', finish); child.once('exit', finish);
+            try { child.stdin.end(); } catch { if (child.exitCode !== null || child.signalCode !== null) finish(); }
+          });
+        }
+      } finally { this.deviceId = null; }
+    })();
+    this.disconnectPromise = pending;
+    try { await pending; }
+    finally { if (this.disconnectPromise === pending) this.disconnectPromise = null; }
   }
 }

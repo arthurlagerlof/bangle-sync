@@ -10,8 +10,13 @@
     "node": ">=20"
   },
   "license": "MIT",
-  "dependencies": {
-    "espruino": "0.1.67"
+  "peerDependencies": {
+    "espruino": "^0.1.67"
+  },
+  "peerDependenciesMeta": {
+    "espruino": {
+      "optional": true
+    }
   },
   "files": [
     "bin/",

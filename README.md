@@ -4,7 +4,7 @@ A reusable CLI foundation for backing up and synchronising Bangle.js watches. It
 
 ## Requirements
 
-Node.js 20 or newer. The package includes EspruinoTools and uses its JavaScript CLI through a subprocess adapter. The adapter has been exercised on a limited Windows/watch setup for scoped operations, but this is not a cross-platform or general reliability qualification. See [Technical decisions](docs/TECHNICAL-DECISIONS.md) for what was actually tested.
+Node.js 20 or newer. EspruinoTools is an optional peer and is not installed with the core CLI, so ordinary workspace, profile, backup-manifest, and simulated commands do not install Bluetooth/native build dependencies. Physical commands require a separately installed EspruinoTools JavaScript CLI and `transport.espruinoPath` configuration. EspruinoTools `0.1.67` has legacy transitive advisories in its optional BLE backends; those apply when that separate hardware tool is installed. Hardware support has only been exercised on the documented Windows/watch setup. See [Technical decisions](docs/TECHNICAL-DECISIONS.md) for test scope and dependency limitations.
 
 ## Installable CLI and workspaces
 
@@ -30,11 +30,20 @@ node .\bin\bangle-sync.js diff --simulate --backup 'D:\BangleBackups\<timestamp>
 node .\bin\bangle-sync.js sync --dry-run --simulate
 ```
 
+Optional physical hardware setup (EspruinoTools is not installed by BangleSync):
+
+```powershell
+npm install --global espruino@0.1.67
+$espruinoCli = Join-Path (npm root -g) 'espruino\bin\espruino-cli.js'
+bangle-sync config set transport.espruinoPath $espruinoCli
+```
+
+EspruinoTools currently brings its own optional BLE/native dependency tree and reported advisories; installing it is a separate, explicit hardware choice. See [Technical decisions](docs/TECHNICAL-DECISIONS.md) before enabling physical operations.
 The simulator is process-local and has no actual watch contents. Simulated backup output reports `COMPLETE_AND_VERIFIED` or `INCOMPLETE`; verification checks the manifest and saved hashes. StorageFiles containing `0xFF` are unsupported/incomplete due to the end-marker limitation and must not be called byte-perfect. Backups are logical Storage archives, not firmware/device images. The legacy `push` and `deploy` commands remain disabled. The simulator did not access a watch; separate selected-scope physical operations are documented below. See [Technical decisions](docs/TECHNICAL-DECISIONS.md) for firmware provenance and unresolved qualification requirements.
 
 ## Hardware readiness and limits
 
-The EspruinoTools subprocess adapter implements physical discovery, connection, catalog-bounded inventory, selected-file reads/diff and backups, guarded app-file updates, and explicit app launch/clock restore. Physical update writes are enabled only through the reviewed `sync --apply` flow; they are **recoverable but not atomic**. On 2026-11-11 a physical Bangle.js 2 test created and replaced a generated temporary clock app, verified both readbacks by SHA-256, independently verified a selected-scope backup, launched the app, restored the clock, and erased and verified removal of the exact test file. Automatic reconnect after a forced host-process disconnect failed; a fresh discovery and connection later succeeded. Interrupted staging was not tested on the watch. These results do not qualify arbitrary devices, all BLE conditions, all payloads, settings writes, or power-loss recovery. Firmware `2v27.62` is not tied to an exact firmware image/build. No firmware or low-level system data is inspected. See [Technical decisions](docs/TECHNICAL-DECISIONS.md) for test evidence and boundaries.
+The EspruinoTools subprocess adapter implements physical discovery, connection, catalog-bounded inventory, selected-file reads/diff and backups, guarded app-file updates, and explicit app launch/clock restore. Physical update writes are enabled only through the reviewed `sync --apply` flow; they are **recoverable but not atomic**. On 2026-11-11 the actual CLI created a generated temporary clock app, performed two replacements, and used `device diff --pull` snapshots to verify read-back bytes and SHA-256 after each version; the pre-change backup was independently verified. The exact test file was erased and verified absent. Three subprocess-termination reconnect trials and three clean disconnect/reconnect cycles succeeded after adding bounded rediscovery. The actual CLI launch command failed once; a subsequent `device show-clock` succeeded. Physical app launch is not yet qualified through the external-CLI configuration. Interrupted staging was not tested on the watch. These tests do not qualify arbitrary devices, all BLE conditions, all payloads, settings writes, or power-loss recovery. Firmware `2v27.62` is not tied to an exact firmware image/build. No firmware or low-level system data is inspected. See [Technical decisions](docs/TECHNICAL-DECISIONS.md) for test evidence and boundaries.
 
 The fixture in `fixtures/` is separate from this adapter: it is exercised only with a mock and is not ready to upload to a watch.
 
