@@ -1,0 +1,25 @@
+{
+  "name": "bangle-sync",
+  "version": "0.2.0",
+  "description": "A safe CLI for backing up and synchronising Bangle.js watches",
+  "type": "module",
+  "bin": {
+    "bangle-sync": "./bin/bangle-sync.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "espruino": "0.1.67"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  }
+}

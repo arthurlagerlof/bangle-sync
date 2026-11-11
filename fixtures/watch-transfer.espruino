@@ -1,0 +1,58 @@
+// Unexecuted Espruino prototype. Requires a supervised REPL adapter to capture marker lines.
+(function (storageName, transferId, chunkSize) {
+  var storage = require('Storage');
+  var prefix = '@@BANGLESYNC/1:';
+  var suffix = ':END@@';
+  var alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  var size = chunkSize === undefined ? 48 : chunkSize;
+  if (typeof storageName !== 'string' || storageName.length < 1 || storageName.length > 28 || /[\x00-\x1f\x7f]/.test(storageName)) throw new Error('Invalid Storage filename');
+  if (typeof transferId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(transferId)) throw new Error('Invalid transfer identifier');
+  if (typeof size !== 'number' || size % 1 || size < 1 || size > 48) throw new Error('Invalid chunk size');
+  var crcTable = [];
+  for (var n = 0; n < 256; n++) {
+    var c = n;
+    for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crcTable[n] = c >>> 0;
+  }
+  function crc32(text) {
+    var crc = 0xffffffff;
+    for (var i = 0; i < text.length; i++) crc = crcTable[(crc ^ (text.charCodeAt(i) & 255)) & 255] ^ (crc >>> 8);
+    return ((crc ^ 0xffffffff) >>> 0).toString(16);
+  }
+  function base64(text) {
+    var out = '';
+    for (var i = 0; i < text.length; i += 3) {
+      var a = text.charCodeAt(i) & 255;
+      var hasB = i + 1 < text.length, hasC = i + 2 < text.length;
+      var b = hasB ? text.charCodeAt(i + 1) & 255 : 0;
+      var c = hasC ? text.charCodeAt(i + 2) & 255 : 0;
+      out += alphabet.charAt(a >> 2) + alphabet.charAt(((a & 3) << 4) | (b >> 4));
+      out += hasB ? alphabet.charAt(((b & 15) << 2) | (c >> 6)) : '=';
+      out += hasC ? alphabet.charAt(c & 63) : '=';
+    }
+    return out;
+  }
+  function emit(record) {
+    print(prefix + transferId + ':' + JSON.stringify(record) + suffix);
+  }
+  try {
+    var total = 0, offset = 0, part;
+    do {
+      part = storage.read(storageName, offset, size);
+      if (part === undefined && offset === 0) throw new Error('Storage file not found');
+      if (part === undefined) part = '';
+      total += part.length;
+      offset += part.length;
+    } while (part.length === size);
+    emit({ kind: 'start', transferId: transferId, name: storageName, type: 'ordinary', totalLength: total, chunkSize: size });
+    var sequence = 0;
+    for (offset = 0; offset < total; offset += size, sequence++) {
+      part = storage.read(storageName, offset, Math.min(size, total - offset));
+      if (part === undefined || part.length !== Math.min(size, total - offset)) throw new Error('File changed or short read');
+      emit({ kind: 'chunk', transferId: transferId, sequence: sequence, offset: offset, length: part.length, crc32: crc32(part), encoding: 'base64', payload: base64(part) });
+    }
+    emit({ kind: 'end', transferId: transferId, totalLength: total, chunks: sequence });
+  } catch (error) {
+    emit({ kind: 'error', transferId: transferId, message: String(error) });
+  }
+})('filename', 'unique-host-generated-id', 48);
