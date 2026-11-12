@@ -21,7 +21,8 @@ const exec = promisify(execFile);
 export const VERSION = '0.2.0';
 export const CONFIG_NAME = 'bangle-sync.json';
 export function starterConfig() { return { schemaVersion: 1, project: { name: 'my-bangle-project' }, sources: [], devices: {}, backup: { directory: join(homedir(), 'BangleSync-Device-Backups') } }; }
-export function usage() { return `bangle-sync ${VERSION}\n\nUsage: bangle-sync <command> [options]\n\nCommands:\n  init         Create starter configuration\n  workspace    status | diff | import-device | update-upstream\n  app create|list  Create or list workspace applications\n  theme create|list  Manage compatible theme manifests\n  behaviour create|list  Manage declared behaviour packages\n  profile create|list|plan|apply  Manage and preview desired-state profiles\n  phone protocol create|list  Define phone BLE protocol metadata\n  config       Manage backup, transport, and explicitly registered setting keys\n  device discover|info|inventory|diff|update|backup|launch|show-clock  Use EspruinoTools subprocess\n  backup list  List backup manifests\n  connect      Connect to a simulated device (--simulate)\n  info         Show simulated device information (--simulate)\n  inventory    List simulated Storage files (--simulate)\n  backup       Create a logical Storage backup (--simulate --destination <dir>)\n  verify       Verify a backup directory (--path <dir>)\n  pull         Retrieve one simulated file (--simulate --name <file>)\n  status       Show device/backup status (--simulate)\n  diff         Compare a simulated inventory with a backup (--simulate --backup <dir>)\n  sync         Preview with --dry-run; apply requires --confirm and --plan-hash\n  push/deploy  Disabled legacy commands; use the guarded sync workflow\n\nPhysical commands use the EspruinoTools subprocess adapter and have limited hardware qualification; --simulate never contacts a watch.\n` }
+export function usage() { return `bangle-sync ${VERSION}\n\nUsage: bangle-sync <command> [options]\n\nCommands:\n  init         Create starter configuration\n  workspace    status | diff | import-device | update-upstream\n  app create|list  Create or list workspace applications\n  theme create|list  Manage compatible theme manifests\n  behaviour create|list  Manage declared behaviour packages\n  profile create|list|plan|apply  Manage and preview desired-state profiles\n  phone protocol create|list  Define phone BLE protocol metadata\n  config       Manage backup, transport, and explicitly registered setting keys\n  device discover|info|inventory|backup|diff|update|launch|show-clock  Use EspruinoTools subprocess
+    device backup --pull  Compare the pinned Git baseline and pull the scoped watch diff\n  backup list  List backup manifests\n  connect      Connect to a simulated device (--simulate)\n  info         Show simulated device information (--simulate)\n  inventory    List simulated Storage files (--simulate)\n  backup       Create a logical Storage backup (--simulate --destination <dir>)\n  verify       Verify a backup directory (--path <dir>)\n  pull         Retrieve one simulated file (--simulate --name <file>)\n  status       Show device/backup status (--simulate)\n  diff         Compare a simulated inventory with a backup (--simulate --backup <dir>)\n  sync         Preview with --dry-run; apply requires --confirm and --plan-hash\n  push/deploy  Disabled legacy commands; use the guarded sync workflow\n\nPhysical commands use the EspruinoTools subprocess adapter and have limited hardware qualification; --simulate never contacts a watch.\n` }
 const json = (o, value) => o.log(JSON.stringify(value, null, 2));
 async function findWorkspace(cwd) {
   let directory = resolve(cwd);
@@ -110,6 +111,11 @@ export async function run(args, cwd = process.cwd(), output = console) {
   const [command, ...opts] = args; const has = x => opts.includes(x); const val = x => { const i = opts.indexOf(x); return i < 0 ? undefined : opts[i + 1]; }; const vals = x => opts.flatMap((item, i) => item === x && opts[i + 1] && !opts[i + 1].startsWith('--') ? [opts[i + 1]] : []);
   if (!command || command === '--help' || command === '-h' || has('--help') || has('-h')) { output.log(usage()); return 0; }
   if (command === '--version' || has('--version') || has('-v')) { output.log(VERSION); return 0; }
+  if (command === 'backup' && opts[0] === 'list') {
+    const root = resolve(val('--destination') || (await config(cwd)).backup?.directory || backupDirectory()), rows = [];
+    try { for (const entry of await readdir(root, { withFileTypes: true })) if (entry.isDirectory()) { const directory = join(root, entry.name); try { const manifestBytes = await readFile(join(directory, 'manifest.json')), manifest = JSON.parse(manifestBytes.toString('utf8')); if (manifest.kind === 'banglesync-device-import') { const seal = (await readFile(join(directory, 'manifest.sha256'), 'utf8')).trim(), valid = createHash('sha256').update(manifestBytes).digest('hex') === seal && manifest.snapshotComplete === true && Array.isArray(manifest.snapshotFiles) && manifest.snapshotFiles.length === manifest.scopeFiles?.length; rows.push({ directory, mode: 'comparison-diff', createdAt: manifest.createdAt, state: valid ? 'COMPLETE_AND_VERIFIED' : 'INCOMPLETE' }); } else { const check = await verifyManagedBackup(directory); rows.push({ directory, mode: manifest.mode, createdAt: manifest.createdAt, state: check.complete ? 'COMPLETE_AND_VERIFIED' : 'INCOMPLETE' }); } } catch { rows.push({ directory, state: 'INCOMPLETE_OR_UNSEALED' }); } } } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    json(output, rows.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''))); return 0;
+  }
   if (command === 'init') { const p = resolve(cwd, CONFIG_NAME); try { await readFile(p); output.error(`${CONFIG_NAME} already exists; refusing to overwrite it.`); return 1; } catch (e) { if (e.code !== 'ENOENT') throw e; } await writeFile(p, `${JSON.stringify(starterConfig(), null, 2)}\n`, { flag: 'wx' }); await initializeManagedWorkspace(cwd); output.log(`Created ${CONFIG_NAME} and managed workspace directories.`); return 0; }
   if (command === 'workspace') {
     const root = val('--path') || await findWorkspace(cwd), action = opts[0];
@@ -211,20 +217,28 @@ export async function run(args, cwd = process.cwd(), output = console) {
       json(output, { ...result, destination, source: 'verified catalogued-user-files import; no device access performed' }); return result.manifest.complete ? 0 : 1;
     }
     if (!has('--simulate')) {
-      const catalog = await deviceCatalog(workspace, action === 'diff' ? vals('--app') : []);
+      const pullDiff = action === 'diff' || (action === 'backup' && has('--pull'));
+      const catalog = await deviceCatalog(workspace, pullDiff ? vals('--app') : []);
       const adapter = new EspruinoCliAdapter({ executable: (await config(workspace)).transport?.espruinoPath || null, ownership: catalog.manifest.ownership, applications: catalog.applications, baselinePaths: catalog.baselinePaths, knownFiles: catalog.knownFiles, inlineFiles: catalog.inlineFiles });
       const devices = await adapter.discover(), index = Number(val('--device-index')) - 1;
       if (!Number.isInteger(index) || index < 0 || index >= devices.length) { output.error(`Select a discovered device with --device-index 1..${devices.length}. Device identifiers are not printed.`); return 2; }
       try {
         const info = await adapter.connect(devices[index].id);
         if (action === 'info' || action === 'connect') { json(output, info); return 0; }
+        if (action === 'backup' && !has('--pull')) {
+          const c = await config(workspace), destination = outsideWorkspace(val('--destination') || c.backup?.directory || backupDirectory(), workspace);
+          const backup = await createManagedBackup(adapter, destination, { mode: has('--full') ? 'full' : 'differential', forceFull: has('--full'), ownership: catalog.manifest.ownership });
+          const verification = backup.manifest.complete ? await verifyManagedBackup(backup.dir) : { complete: false };
+          json(output, { ...backup, destination, verification, note: 'Only catalogued managed user files are read; this is not a device-wide backup.' });
+          return verification.complete ? 0 : 1;
+        }
         if (action === 'launch') { if (!val('--app')) { output.error('Usage: device launch --app <owned-app-id> --confirm --device-index N'); return 2; } json(output, await adapter.launchApp(val('--app'), { confirm: has('--confirm') })); return 0; }
         if (action === 'show-clock') { json(output, await adapter.showClock()); return 0; }
         if (action === 'inventory') {
           const files = await adapter.inventory(), ownership = (await loadWorkspaceManifest(workspace)).ownership;
           json(output, { complete: false, metadataComplete: true, contentVerified: false, scope: 'catalogued-user-files-only', source: 'EspruinoTools subprocess', device: info, files: files.map(file => ({ ...file, ...classifyDeviceFile(file, ownership) })), note: 'Only catalog-declared user filenames were probed with one-byte existence reads; no global Storage listing or low-level files were queried.' }); return 0;
         }
-        if (action === 'diff') {
+        if (pullDiff) {
           if (!catalog.upstreamPin) { output.error('BangleApps is not a Git checkout with an origin; update the upstream clone before comparing.'); return 2; }
           const upstreamStatus = await exec('git', ['-C', join(workspace, 'BangleApps'), 'status', '--porcelain']);
           if (upstreamStatus.stdout.trim()) { output.error('BangleApps has local changes; refusing to compare against an unpinned working tree.'); return 2; }
@@ -248,7 +262,8 @@ export async function run(args, cwd = process.cwd(), output = console) {
           }
           let imported = null;
           if (has('--pull') && snapshot.length) {
-            const stamp = new Date().toISOString().replace(/[:.]/g, '-'), directory = join(workspace, 'BangleCustom', 'device-imports', stamp), filesDir = join(directory, 'files'), snapshotDir = join(directory, 'snapshot');
+            const c = await config(workspace), backupRoot = outsideWorkspace(val('--destination') || c.backup?.directory || backupDirectory(), workspace);
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-'), directory = join(backupRoot, stamp), filesDir = join(directory, 'files'), snapshotDir = join(directory, 'snapshot');
             await mkdir(filesDir, { recursive: true }); await mkdir(snapshotDir, { recursive: true });
             for (const record of snapshot) await writeFile(join(snapshotDir, record.item.name), record.data, { flag: 'wx' });
             for (const change of changed) await writeFile(join(filesDir, change.item.name), change.data, { flag: 'wx' });
@@ -262,10 +277,9 @@ export async function run(args, cwd = process.cwd(), output = console) {
         }
         if (action === 'backup') {
           if (has('--include-unknown')) { output.error('Unknown-file capture is disabled: only catalogued and explicitly registered user files are queried.'); return 2; }
-          const c = await config(cwd), mode = val('--mode') || 'full';
+          const c = await config(cwd), forceFull = has('--full');
           const destination = outsideWorkspace(val('--destination') || c.backup?.directory || backupDirectory(), workspace);
-          const baseline = mode === 'differential' ? { root: val('--baseline-root') ? resolve(cwd, val('--baseline-root')) : null, commit: val('--baseline-commit'), repository: val('--baseline-repository') } : null;
-          const result = await createManagedBackup(adapter, destination, { mode, includeUnknown: has('--include-unknown'), ownership: catalog.manifest.ownership, baseline, onProgress: progress => output.log(`Backup progress: ${progress.completed}/${progress.total} catalogued user files.`) });
+          const result = await createManagedBackup(adapter, destination, { forceFull, ownership: catalog.manifest.ownership, onProgress: progress => output.log(`Backup progress: ${progress.completed}/${progress.total} catalogued user files.`) });
           json(output, { ...result, transport: 'EspruinoTools subprocess; hardware behavior is not qualified' }); return result.manifest.complete ? 0 : 1;
         }
         output.error('Usage: device discover|info|inventory|backup [--device-index N]'); return 2;
@@ -280,17 +294,16 @@ export async function run(args, cwd = process.cwd(), output = console) {
       json(output, { complete: false, source: 'process-local simulator', files: files.map(file => { const application = associateApplication(file.name, catalog); return { ...file, application, ...classifyDeviceFile({ ...file, application }) }; }), note: 'Metadata-first result; unknown and protected content is not read.' }); return 0;
     }
     if (action === 'backup') {
-      const mode = val('--mode') || 'full', c = await config(cwd); let destination;
+      const forceFull = has('--full'), c = await config(cwd); let destination;
       try { destination = outsideWorkspace(val('--destination') || c.backup?.directory || backupDirectory(), workspace); } catch (error) { output.error(error.message); return 2; }
-      const baseline = mode === 'differential' ? { root: val('--baseline-root') ? resolve(cwd, val('--baseline-root')) : null, commit: val('--baseline-commit'), repository: val('--baseline-repository') } : null;
-      try { const result = await createManagedBackup(device, destination, { mode, includeUnknown: has('--include-unknown'), baseline }); json(output, result); return result.manifest.complete ? 0 : 1; }
+      try { const result = await createManagedBackup(device, destination, { forceFull }); json(output, result); return result.manifest.complete ? 0 : 1; }
       catch (error) { output.error(error.message); return 2; }
     }
     output.error('Usage: device inventory|backup --simulate [--mode full|differential]'); return 2;
   }
   if (command === 'backup' && opts[0] === 'list') {
     const c = await config(cwd), root = resolve(val('--directory') || c.backup?.directory || backupDirectory()), records = [];
-    for (const name of await readdir(root).catch(() => [])) { try { const path = join(root, name), m = JSON.parse(await readFile(join(path, 'manifest.json'), 'utf8')); records.push({ directory: path, createdAt: m.createdAt, mode: m.mode ?? 'logical', complete: m.complete === true, kind: m.kind }); } catch {} }
+    for (const name of await readdir(root).catch(() => [])) { try { const path = join(root, name), m = JSON.parse(await readFile(join(path, 'manifest.json'), 'utf8')); records.push({ directory: path, createdAt: m.createdAt, mode: m.mode ?? (m.kind === 'banglesync-device-import' ? 'comparison-diff' : 'logical'), complete: m.complete === true || m.snapshotComplete === true, kind: m.kind }); } catch {} }
     json(output, records); return 0;
   }
   if (command === 'verify') { if (!val('--path')) { output.error('Usage: verify --path <backup-directory>'); return 2; } const target = resolve(cwd, val('--path')), m = JSON.parse(await readFile(join(target, 'manifest.json'), 'utf8')); const r = m.kind === 'banglesync-managed-backup' ? await verifyManagedBackup(target, { baselineRoot: val('--baseline-root') ? resolve(cwd, val('--baseline-root')) : undefined, outputDirectory: val('--reconstruct') ? resolve(cwd, val('--reconstruct')) : undefined }) : await verifyBackup(target); json(output, r); return r.complete ? 0 : 1; }

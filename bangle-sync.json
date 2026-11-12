@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "name": "my-bangle-project"
+  },
+  "sources": [],
+  "devices": {},
+  "backup": {
+    "directory": "C:\\Users\\arthu\\Projects\\Bangle"
+  }
+}

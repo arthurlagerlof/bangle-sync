@@ -23,17 +23,23 @@ async function baselineBytes(root, commit, path) {
   return Buffer.from(stdout);
 }
 
-export async function createManagedBackup(device, backupRoot, { mode = 'full', includeUnknown = false, ownership = {}, baseline = null, onProgress = () => {} } = {}) {
+export async function createManagedBackup(device, backupRoot, { mode = 'differential', forceFull = false, includeUnknown = false, ownership = {}, onProgress = () => {} } = {}) {
   if (!['full', 'differential'].includes(mode)) throw new Error('Backup mode must be full or differential.');
-  if (mode === 'differential' && (!baseline?.root || !baseline?.commit || !baseline?.repository)) throw new Error('Differential backup requires an explicit repository root, exact commit SHA, and repository identity.');
   if (includeUnknown !== true && includeUnknown !== false) throw new Error('includeUnknown must be an explicit boolean.');
-  if (mode === 'differential' && !/^[a-f0-9]{40,64}$/i.test(baseline.commit)) throw new Error('Baseline commit must be an exact Git commit SHA.');
-  if (mode === 'differential') await verifyBaselineIdentity(baseline.root, baseline.commit, baseline.repository);
   await mkdir(backupRoot, { recursive: true });
-  const dir = resolve(backupRoot, backupName());
-  await mkdir(dir); await mkdir(join(dir, 'files'));
-  const warnings = [], entries = [], seen = new Set();
-  let inventory = [], deviceInfo = null, error;
+  const root = resolve(backupRoot);
+  let previous = null;
+  if (!forceFull && mode !== 'full') {
+    const candidates = await readdir(root, { withFileTypes: true });
+    for (const item of candidates) if (item.isDirectory()) {
+      const path = join(root, item.name);
+      try { const check = await verifyManagedBackup(path); const m = JSON.parse(await readFile(join(path, 'manifest.json'), 'utf8')); if (check.complete && (!previous || m.createdAt > previous.manifest.createdAt)) previous = { path, manifest: m }; } catch {}
+    }
+  }
+  if (!previous) mode = 'full';
+  const previousFiles = new Map((previous?.manifest.files ?? []).filter(f => f.status === 'captured' || f.status === 'unchanged').map(f => [f.name, f]));
+  const dir = resolve(root, backupName()); await mkdir(dir); await mkdir(join(dir, 'files'));
+  const warnings = [], entries = [], seen = new Set(); let inventory = [], deviceInfo = null, error;
   try { deviceInfo = await device.info(); inventory = await device.inventory(); } catch (e) { error = e.message; }
   for (const item of inventory) {
     onProgress({ completed: entries.length, total: inventory.length });
@@ -52,34 +58,24 @@ export async function createManagedBackup(device, backupRoot, { mode = 'full', i
       if (entry.storageFile && content.includes(255)) throw new Error('StorageFile contains unsupported 0xFF and cannot be verified as a complete logical backup.');
       const confirmation = await device.read(item.name, { storageFile: entry.storageFile });
       if (!Buffer.isBuffer(confirmation) || !confirmation.equals(content)) throw new Error('Device file changed during backup capture.');
-      entry.size = content.length; entry.sha256 = hash(content); entry.status = 'captured';
-      if (mode === 'differential') {
-        try {
-          const path = item.baselinePath ?? item.name;
-          if (typeof path !== 'string' || path.startsWith('/') || path.split(/[\\/]/).includes('..')) throw new Error('Unsafe baseline path');
-          const upstream = await baselineBytes(baseline.root, baseline.commit, path);
-          if (upstream.equals(content)) {
-            entry.status = 'baseline-reference';
-            entry.baseline = { repository: baseline.repository, commit: baseline.commit, path, sha256: hash(upstream) };
-            continue;
-          }
-        } catch {}
-      }
-      await writeFile(join(dir, 'files', item.name), content, { flag: 'wx' });
+      entry.size = content.length; entry.sha256 = hash(content);
+      const old = previousFiles.get(item.name);
+      if (old && old.sha256 === entry.sha256 && old.storageFile === entry.storageFile) { entry.status = 'unchanged'; entry.baseBackup = previous.path.split(/[\\/]/).pop(); }
+      else { entry.status = 'captured'; await writeFile(join(dir, 'files', item.name), content, { flag: 'wx' }); }
     } catch (e) { entry.status = 'incomplete'; entry.reason = e.message; warnings.push(`${item.name}: ${e.message}`); }
   }
-  let after = [];
-  try { after = await device.inventory(); } catch (e) { error = error ?? e.message; }
+  const after = await device.inventory().catch(e => { error = error ?? e.message; return []; });
   const key = item => `${Boolean(item.storageFile)}:${item.name}:${item.size ?? ''}`;
   const beforeState = inventory.map(key).sort(), afterState = after.map(key).sort();
   const inventoryChanged = beforeState.length !== afterState.length || beforeState.some((value, index) => value !== afterState[index]);
   if (inventoryChanged) warnings.push('Device inventory changed or could not be confirmed during backup.');
-  const managedScopeComplete = !error && !inventoryChanged && !warnings.length && entries.every(x => ['captured', 'baseline-reference', 'excluded'].includes(x.status));
+  const complete = !error && !inventoryChanged && !warnings.length && entries.every(x => ['captured', 'unchanged', 'excluded', 'metadata-only'].includes(x.status));
+  const present = new Set(entries.map(x => x.name));
+  const deleted = [...previousFiles.keys()].filter(name => !present.has(name));
   const excluded = entries.filter(entry => ['excluded', 'metadata-only'].includes(entry.status)).map(({ name, classification, status, reason }) => ({ name, classification, status, reason }));
-  const manifest = { schemaVersion: 1, kind: 'banglesync-managed-backup', mode, createdAt: new Date().toISOString(), device: deviceInfo, complete: managedScopeComplete, managedScopeComplete, deviceWideBackup: false, excluded, inventoryChanged, inventoryError: error ?? null, includeUnknown, baseline: mode === 'differential' ? { repository: baseline.repository, repositoryIdentity: repoIdentity(baseline.repository), commit: baseline.commit } : null, files: entries, warnings };
-  const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
-  await writeFile(join(dir, 'manifest.json'), manifestBytes, { flag: 'wx' });
-  await writeFile(join(dir, 'manifest.sha256'), `${hash(manifestBytes)}\n`, { flag: 'wx' });
+  const manifest = { schemaVersion: 2, kind: 'banglesync-managed-backup', mode, createdAt: new Date().toISOString(), device: deviceInfo, complete, managedScopeComplete: complete, deviceWideBackup: false, excluded, deleted, parent: mode === 'differential' && previous ? previous.path.split(/[\\/]/).pop() : null, inventoryChanged, inventoryError: error ?? null, includeUnknown, files: entries, warnings };
+  const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
+  if (complete) { await writeFile(join(dir, 'manifest.json'), bytes, { flag: 'wx' }); await writeFile(join(dir, 'manifest.sha256'), `${hash(bytes)}\n`, { flag: 'wx' }); }
   return { dir, manifest };
 }
 
@@ -114,6 +110,14 @@ export async function createBackupFromImport(importDirectory, backupRoot) {
 }
 
 async function assertRegularDirectory(path) { const info = await lstat(path); if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Expected a regular directory: ${path}`); }
+async function readManagedFile(dir, name) {
+  const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8'));
+  const entry = manifest.files.find(file => file.name === name && ['captured', 'unchanged'].includes(file.status));
+  if (!entry) throw new Error(`Managed file is absent from backup chain: ${name}`);
+  if (entry.status === 'captured') return readFile(join(dir, 'files', name));
+  if (!manifest.parent || entry.baseBackup !== manifest.parent) throw new Error('Invalid unchanged-file chain reference.');
+  return readManagedFile(join(dirname(dir), manifest.parent), name);
+}
 export async function verifyManagedBackup(dir, { baselineRoot, outputDirectory } = {}) {
   const root = resolve(dir); await assertRegularDirectory(root); await assertRegularDirectory(join(root, 'files'));
   const manifestPath = join(root, 'manifest.json'), info = await lstat(manifestPath);
@@ -121,12 +125,21 @@ export async function verifyManagedBackup(dir, { baselineRoot, outputDirectory }
   const manifestBytes = await readFile(manifestPath), sealInfo = await lstat(join(root, 'manifest.sha256'));
   if (!sealInfo.isFile() || sealInfo.isSymbolicLink() || (await readFile(join(root, 'manifest.sha256'), 'utf8')).trim() !== hash(manifestBytes)) throw new Error('Backup manifest integrity check failed.');
   const m = JSON.parse(manifestBytes.toString('utf8'));
-  if (m.schemaVersion !== 1 || m.kind !== 'banglesync-managed-backup' || m.deviceWideBackup !== false || !Array.isArray(m.files) || !['full', 'differential'].includes(m.mode)) throw new Error('Invalid or unsafe managed backup manifest.');
-  if (m.mode === 'differential' && (!m.baseline || !/^[a-f0-9]{40,64}$/i.test(m.baseline.commit))) throw new Error('Differential backup lacks a pinned baseline.');
-  if (m.mode === 'differential' && !baselineRoot) throw new Error('Differential verification and reconstruction require the baseline repository checkout.');
-  if (m.mode === 'differential') {
+  if (![1, 2].includes(m.schemaVersion) || m.kind !== 'banglesync-managed-backup' || m.deviceWideBackup !== false || !Array.isArray(m.files) || !['full', 'differential'].includes(m.mode)) throw new Error('Invalid or unsafe managed backup manifest.');
+  if (m.schemaVersion === 2 && (m.mode === 'full' ? m.parent !== null : typeof m.parent !== 'string')) throw new Error('Managed backup mode has an invalid parent-chain reference.');
+  if (m.schemaVersion === 2 && (!Array.isArray(m.deleted) || m.deleted.some(name => !safeName(name)) || new Set(m.deleted).size !== m.deleted.length)) throw new Error('Managed backup deletion metadata is invalid.');
+  if (m.schemaVersion === 1 && m.mode === 'differential' && (!m.baseline || !/^[a-f0-9]{40,64}$/i.test(m.baseline.commit))) throw new Error('Differential backup lacks a pinned baseline.');
+  if (m.schemaVersion === 1 && m.mode === 'differential' && !baselineRoot) throw new Error('Differential verification and reconstruction require the baseline repository checkout.');
+  if (m.schemaVersion === 1 && m.mode === 'differential') {
     if (repoIdentity(m.baseline.repository) !== m.baseline.repositoryIdentity) throw new Error('Baseline repository identity mismatch.');
     await verifyBaselineIdentity(baselineRoot, m.baseline.commit, m.baseline.repository);
+  }
+  let parentCheck = null, parentDir = null;
+  if (m.schemaVersion === 2 && m.parent) {
+    if (!safeName(m.parent)) throw new Error('Invalid managed backup parent reference.');
+    parentDir = join(dirname(root), m.parent);
+    parentCheck = await verifyManagedBackup(parentDir, { baselineRoot });
+    if (!parentCheck.complete) throw new Error('Managed backup parent chain is incomplete.');
   }
   if (outputDirectory) {
     const preflight = await verifyManagedBackup(root, { baselineRoot });
@@ -151,10 +164,13 @@ export async function verifyManagedBackup(dir, { baselineRoot, outputDirectory }
         if (!contentInfo.isFile() || contentInfo.isSymbolicLink()) throw new Error('Captured file is not a regular file.');
         const data = await readFile(contentPath); if (data.length !== f.size || hash(data) !== f.sha256) throw new Error('Captured content hash mismatch.');
         expected.add(f.name);
+      } else if (f.status === 'unchanged' && m.schemaVersion === 2 && parentCheck) {
+        const bytes = await readManagedFile(parentDir, f.name);
+        if (bytes.length !== f.size || hash(bytes) !== f.sha256 || f.baseBackup !== m.parent) throw new Error('Unchanged-file chain reference failed verification.');
       } else throw new Error(`Unknown file status: ${f.status}`);
       if (outputDirectory) {
         if (!baselineRoot && f.status === 'baseline-reference') throw new Error('Baseline repository root is required for reconstruction.');
-        const content = f.status === 'captured' ? await readFile(join(root, 'files', f.name)) : await baselineBytes(baselineRoot, m.baseline.commit, f.baseline.path);
+        const content = f.status === 'captured' ? await readFile(join(root, 'files', f.name)) : f.status === 'unchanged' ? await readManagedFile(parentDir, f.name) : await baselineBytes(baselineRoot, m.baseline.commit, f.baseline.path);
         const target = resolve(outputDirectory, f.name);
         if (!target.startsWith(`${resolve(outputDirectory)}\\`)) throw new Error('Unsafe reconstruction path.');
         await mkdir(dirname(target), { recursive: true }); await writeFile(target, content, { flag: 'wx' });
